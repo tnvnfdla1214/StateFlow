@@ -2,6 +2,8 @@
 
 이포스터는 LiveData에서 StateFlow로 바꿔야하는 이유와 바꾸는 방법에 대해서 작성합니다.
 
+이 포스터는 [이 블로그](https://proandroiddev.com/should-we-choose-kotlins-stateflow-or-sharedflow-to-substitute-for-android-s-livedata-2d69f2bd6fa5) 를 참고하여 작성하였습니다.
+
 ## LiveData란
 LiveData 는 옵저버 패턴을 활용하여 구현되었으며, 관찰 가능한 일반 클래스인 ObservableXXX 클래스와는 달리 LiveData 는 생명주기의 변화를 인식합니다. 즉, Activity, Fragment, Service 등 안드로이드 컴포넌트의 생명 주기 인식을 통해 Active 상태에 있는 컴포넌트에서만 업데이트합니다. 자세한 내용은 [LiveData](https://github.com/tnvnfdla1214/LiveData)를 확인해주세요.
 
@@ -323,7 +325,7 @@ class NearbyUsersDataSource @Inject constructor() {
 ```
 이 코드를 읽어보면 SharedFlow를 flow collector 그 자체로 생각하는데 도움이 될 것입니다. 여기에서 SharedFlow는 cold flow를 hot flow로 바꿔주며, 이 스트림을 듣고 있는 많은 colletor에게 값을 공유해주고 있습니다. 위에서 내려오는 (upstream) cold flow를 아래에서 듣고 있는 (downstream) 많은 collector에게 전달해 주는, 중간자 적인 역할을 합니다.
 
-이제, 아마 우리의 Activity는 아무런 수정이 필요 없다고 생각할 수도 있습니다. 아닙니다! 해야 할 것이 있는데요, launchWhenStarted{} 로 시작된 코루틴 flow를 collect 할 때는, 코루틴은 onStop() 에서 멈춰져야 하고 onStart() 에서 재시작되어야 하지만, 현재는 계속 flow를 subscribe 하고 있습니다. MutableSharedFlow<T>를 보시면, MutableSharedFlow<T>.subscriptionCount는 멈춰져 있는 코루틴에 대해서는 값이 변경되지 않습니다. SharingStarted.WhileSubscribed() 의 진정한 힘을 이용하기 위해서, 우리는 정확하게 onStop() 에서 unsubscribe 해야 하고, onStart()에서 다시 subscribe 해야 합니다. 이것은 collect 하는 코루틴을 캔슬하고, 다시 생성해야 한다는 것을 의미합니다.
+이제, 아마 우리의 Activity는 아무런 수정이 필요 없다고 생각할 수도 있습니다. 아닙니다! 해야 할 것이 있는데요, launchWhenStarted{} 로 시작된 코루틴 flow를 collect 할 때는, 코루틴은 onStop() 에서 멈춰져야 하고 onStart() 에서 재시작되어야 하지만, 현재는 계속 flow를 subscribe 하고 있습니다. MutableSharedFlow\<T>를 보시면, MutableSharedFlow\<T>.subscriptionCount는 멈춰져 있는 코루틴에 대해서는 값이 변경되지 않습니다. SharingStarted.WhileSubscribed() 의 진정한 힘을 이용하기 위해서, 우리는 정확하게 onStop() 에서 unsubscribe 해야 하고, onStart()에서 다시 subscribe 해야 합니다. 이것은 collect 하는 코루틴을 캔슬하고, 다시 생성해야 한다는 것을 의미합니다.
 
 (참고로 이 이슈 와 이 이슈를 보시면 더 자세한 내용을 확인하실 수 있습니다.)
 
@@ -388,8 +390,148 @@ class NearbyUsersActivity : AppCompatActivity() {
 ```
 observeIn(LifecycleOwner) 를 통해 생성된 collector 코루틴은 LifecycleOwner의 Lifecycle이 CREATED 상태가 되었을 때 detroy 되고, (onStop()가 호출된 직후) LifecycleOwner의 Lifecycle이 STARTED 상태가 되었을 때 (onStart() 가 호출된 이후) 다시 생성됩니다.
   
-  ##### 일러두기
-  
+##### 일러두기
+왜 CREATED 상태인가요? STOPPED 상태일 때 호출되어야 하는게 아닌가요? 이것은 직관적인 것과는 정반대가 아닌가 하는 생각이 들겠지만, 이건 정확하게 맞는 말입니다. Lifecycle.State 은 다음과 같은 상태밖에 없습니다: CREATED, DESTROYED, INITIALIZED, RESUMED, STARTED. 
+여기에는  STOPPED 또는 PAUSED 상태가 없습니다. lifecycle 이 onPause() 상태가 되면, 새로운 상태로 변하는 대신 STARTED 상태로 되돌아갑니다. onStop()가 되면, lifeCycle 상태는 CREATED 상태로 되돌아갑니다.
+
+<div align="center">
+<img src = "https://user-images.githubusercontent.com/48902047/150666322-86850d8c-1a23-452e-8b9e-49fc95c8235e.png">
+</div>
+
+이제 우리는 한 번만 생성(materializes) 되고, 여러 subscriber에 데이터를 공유해 주는 Data Source를 가지게 되었습니다. subscriber가 없다면 데이터를 요청하지 않고, 하나 이상의 subscriber가 다시 추가되면 곧바로 다시 데이터 요청을 시작하게 됩니다. 안드로이드 플랫폼에 의존적이지 않고 메인 쓰레드에 묶여있지 않습니다. (Flow 변환은 다른 쓰레드에서 할 수 있는데, 간단하게 flowOn(Dispatchers.IO) 또는 .flowOn(Dispatchers.Default)같은  .flowOn() 오퍼레이터를 쓰면 됩니다)
+
+## 의문점
+#### 하지만 만약 현재 Flow를 collect 하지 않으면서도 상태에 접근해야 할 때가 있다면?
+
+만약 우리가 정말 마치 LiveData에서와 같이 Flow의 상태에 접근해야 한다면, 우리는 StateFlow를 이용할 수 있는데, 제약사항이 가해진 SharedFlow 입니다.
+
+Flow를 생성하기 위해서 shareIn() 오퍼레이터를 사용하는 대신, 우리는  stateIn() 오퍼레이터를 사용할 수 있습니다.
+
+```Kotlin
+fun <T> Flow<T>.stateIn(
+    scope: CoroutineScope, 
+    started: SharingStarted, 
+    initialValue: T
+): StateFlow<T> (source)
+```
+이 메소드 파라메터에서 볼 수 있는 것 처럼, sharedIn() 와 stateIn() 사이에는 두 가지 기본적인 차이점이 있습니다.
+
+1. stateIn() 은 replay 값을 설정 할 수 없습니다. StateFlow는 SharedFlow 에서 replay 값이 1로 고정된 것입니다. 이 말은 새로운 subscriber는 즉시 현재 상태 값을 받게 된다는 의미입니다.
+2. stateIn()은 초기 값이 필요합니다. 이 말은 만약 당신이 처음에 설정해 줄 값이 없다면, StateFlow\<T> 에서 T 에 들어갈 타입을 null 일 수 있는 타입으로 설정하거나, sealed class를 설정해서 "비어있는 초기 값"을 정의해 줘야 한다는 의미입니다.
+
+
+```Kotlin
+// MutableStateFlow(initialValue) is a shared flow with the following parameters:
+val shared = MutableSharedFlow(
+    replay = 1,
+    onBufferOverflow = BufferOverflow.DROP_OLDEST
+)
+shared.tryEmit(initialValue) // emit the initial value
+val state = shared.distinctUntilChanged() // get StateFlow-like behavior
+```
+SharedFlow 를 사용하기에 적합한 곳은 StateFlow 에서 추가 버퍼가 필요하거나, 여러 개의 최근 값을 반환해야 하거나, 초기값을 무시해야 하는 곳입니다.
+
+하지만, SharedFlow를 선택할 때 명백하게 타협해야 할 부분이 하나 있는데, 그것은 바로 StateFlow\<T>.value를 잃게 된다는 것입니다.
+
+
+#### 둘 중 어느 것을 선택해야 하나요? StateFlow 아니면 SharedFlow?
+
+이 문제에 대한 답을 찾는 쉬운 방법은 다른 질문을 몇 가지 해보는 것입니다.
+
+"내가 정말 언제든지 myFlow.value 이런 방식으로 flow의 현재 상태에 접근해야만 하는가? "
+
+만약 답이 아니오 라면, SharedFlow를 고려해도 좋을 것 같습니다.
+
+"내가 반복되는 값을 발신하고, 그것을 collect 하는 동작을 지원해야 하는가?"
+
+만약 답이 예 라면, SharedFlow를 고려하시기 바랍니다.
+
+"내가 최신 값 1개가 아닌, 그 이전의 값까지 더 많은 값을 subscriber 에게 제공할 수 있어야 하는가?"
+
+만약 답이 예 라면, SharedFlow를 고려하시기 바랍니다.
+
+우리가 살펴본 것 처럼, StateFlow를 모든 곳에 사용하는 것은 올바른 답이 아닙니다.
+
+1. StateFlow는 반복되는 결과 값을 무시합니다. (conflates)그리고 무시하지 않도록 설정할 수도 없습니다. 가끔은 반복해서 들어오는 값을 무시하지 않아야 할 때가 있습니다. 예를 들면, 접속 시도 결과 값 같은 경우에는 매번 실패할 때 마다 재시도해야 할 수 있습니다. 
+
+2. 또한, StateFlow는 초기값이 필요합니다. SharedFlow는 .value같은 것이 존재하지 않기 때문에, 초기 값을 넣어 초기화할 필요가 없습니다. collector는 단시 첫 번째 값이 올 때 까지 기다립니다. 값이 들어오기 전에는 그 누구도 그 값에 접근하려하지 않을 것입니다. 만약 당신이 StateFlow 를 쓰면서 초기값이 없다면, 당신은 StateFlow의 타입 T 를 nullable 하게, T? 와 같이 설정한 다음 초기 값으로 null을 넣어줘야 합니다. (아니면, sealed class 를 생성한 다음, 초기 값으로 값이 없는 상태를 지정해 줘야 합니다)
+
+3. 또한, replay 값을 설정해 줘야 합니다. SharedFlow 는 최근 n개의 값을 새로운 subscriber에게 전달해 줄 수 있습니다. StateFlow는 고정된 replay 값 1을 가지고 있고, 이 말은 현재 상태만을 공유할 수 있다는 의미입니다.
+
+이 둘은 모두 SharingStarted ( Eagerly, Lazily 또는 WhileSubscribed()) 설정을 지원합니다. 저는 일반적으로 SharingStarted.WhileSubscribed()를 사용하고, Activity 에서 onStart / onStop 될 때 모든 collecter를 파괴 / 재생성 하기 때문에, 사용자가 앱을 사용하지 않을 때 데이터소스가 데이터를 요청하지 않습니다. (이것은 LiveData에서 onActive / onInactive 일 때, 리스너를 제거/다시 추가하는 동작과 비슷합니다)
+
+StateFlow가 SharedFlow 보다 더 많이 가지고 있는 제약사항은, 아마 당신의 사용 목적에 정확하게 일치하지는 않을지도 모릅니다. 아마 당신은 좀 더 많은 것을 설정하기를 원할 것이고, SharedFlow를 사용하는 것을 택할지도 모릅니다. 개인적으로는, 저는 거의 myFlow.value와 같이 직접 값에 접근하지 않고, SharedFlow의 유연성을 좋아하기 때문에 SharedFlow를 선택하는 경우가 많습니다.
+
+공식 문서에서 StateFlow 와 SharedFlow 에 대해 더 찾아보세요.
+
+#### StateFlow가 아닌, SharedFlow가 필요한 실제 예제
+
+아래와 같은, 구글 결제 클라이언트 라이브러리가 있다고 가정합시다. 우리는 MutableSharedFlow billingClientStatus 를 가지고 있는데, 이것은 현재 빌링 서비스의 연결 상태를 저장하고 있습니다. 우리는 이 변수의 초기값을 SERVICE_DISCONNECTED으로 설정합니다. 우리는 billingClientStatus 값을 받고, 결과 값이 OK라면 startConnection()를 빌링 서비스에 호출합니다. 연결시도가 실패하면, 우리는 SERVICE_DISCONNECTED를 발신합니다.
+
+이 예제에서, billingClientStatus 가 MutableSharedFlow 가 아니라 MutableStateFlow  였다면, 초기 값이 SERVICE_DISCONNECTED 이고 우리가 시도한 요청의 결과 값 또한 동일하게 SERVICE_DISCONNECTED 이기 때문에 (요청이 실패했기 때문에) 업데이트 되지 않고, 결과적으로는 재접속 요청을 하지 않게 될 것 입니다.
+
+```Kotlin
+@Singleton
+class Biller @Inject constructor(
+    @ApplicationContext private val context: Context,
+) : PurchasesUpdatedListener, BillingClientStateListener {
+    
+    private var billingClient: BillingClient =
+        BillingClient.newBuilder(context)
+            .setListener(this)
+            .enablePendingPurchases()
+            .build()
+        
+    private val billingClientStatus = MutableSharedFlow<Int>(
+        replay = 1,
+        onBufferOverflow = BufferOverflow.DROP_OLDEST
+    )
+    
+    override fun onBillingSetupFinished(result: BillingResult) {
+        billingClientStatus.tryEmit(result.responseCode)
+    }
+
+    override fun onBillingServiceDisconnected() {
+        billingClientStatus.tryEmit(BillingClient.BillingResponseCode.SERVICE_DISCONNECTED)
+    }
+    
+    // ...
+    
+    // Suspend until billingClientStatus == BillingClient.BillingResponseCode.OK
+    private suspend fun requireBillingClientSetup(): Boolean =
+        withTimeoutOrNull(TIMEOUT_MILLIS) {
+            billingClientStatus.first { it == BillingClient.BillingResponseCode.OK }
+            true
+        } ?: false
+   
+    init {
+        billingClientStatus.tryEmit(BillingClient.BillingResponseCode.SERVICE_DISCONNECTED)
+        billingClientStatus.observe(ProcessLifecycleOwner.get()) {
+            when (it) {
+                BillingClient.BillingResponseCode.OK -> with (billingClient) {
+                    updateSkuPrices()
+                    handlePurchases()
+                }
+                else -> {
+                    delay(RETRY_MILLIS)
+                    billingClient.startConnection(this@Biller)
+                }
+            }
+        }
+    }
+
+    private companion object {
+        private const val TIMEOUT_MILLIS = 2000L
+        private const val RETRY_MILLIS = 3000L
+    }
+}
+```
+
+이러한 경우, 우리는 SharedFlow를 써야하고, 이것은 동일한 값이 반복해서 들어오더라도 무시하지 않고 처리합니다.
+
+#### GeoFire 에서 사용했던 Use-Case
+
+당신이 GeoFire 를 사용할 필요가 있다면, 제가 만든 라이브러리인 geofire-ktx 를 써보시기 바랍니다. 이 라이브러리를 이용하면 GeoQuery의 결과를 Flow로 받을 수 있습니다. 또한 DataSnapshot 요청을 다른 DatabaseReference 루트에 GeoFire 루트와 동일한 child key로 요청할 수 있습니다. 마치 이것이 GeoQuery의 일반적인 사용법인 것 처럼 말입니다. 그리고 결과 값을 DataSnapshot 타입이 아닌 다른 클래스로도 받을 수 있습니다. 이것은 Flow 변환을 통해 제공됩니다. 라이브러리의 source code 는 이 글에 있는 예제의 완전한 버전입니다.
 
 
 
